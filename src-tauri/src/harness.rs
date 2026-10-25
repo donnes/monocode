@@ -2786,7 +2786,7 @@ fn is_cursor_agent(path: &Path) -> bool {
 ///
 /// Reads the cached PATH rather than spawning a shell per lookup: six
 /// resolvers each asking `command -v` meant six shell startups per probe.
-fn which_via_login_shell(name: &str) -> Option<PathBuf> {
+pub(crate) fn which_via_login_shell(name: &str) -> Option<PathBuf> {
     which_in_path(&gui_search_path(), name)
 }
 
@@ -3082,6 +3082,14 @@ fn login_shell_env(name: &str) -> Option<String> {
         .as_ref()
         .and_then(|map| map.get(name).cloned())
         .filter(|value| !value.is_empty())
+}
+
+/// The next lookup reads the login shell again. A version manager that put a
+/// versioned directory on PATH has a new one after an upgrade.
+pub(crate) fn forget_login_shell_env() {
+    if let Ok(mut cache) = LOGIN_SHELL_ENV.lock() {
+        *cache = None;
+    }
 }
 
 fn load_login_shell_env() -> HashMap<String, String> {

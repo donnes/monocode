@@ -1,9 +1,12 @@
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::harness::{exec_output, is_resolved_harness_binary};
+use crate::harness::{
+    exec_output, forget_login_shell_env, is_resolved_harness_binary, which_via_login_shell,
+};
 
 const REGISTRY_URL: &str = "https://registry.npmjs.org";
 const USER_AGENT: &str = "MonoCode";
@@ -22,7 +25,8 @@ fn npm_package(provider: &str) -> Option<&'static str> {
 }
 
 /// Each CLI's own updater, which knows how it was installed (native, npm,
-/// Homebrew) better than MonoCode could guess from the binary path.
+/// Homebrew) better than MonoCode could guess from the binary path. mise
+/// installs are the exception; see `mise_tool`.
 fn update_args(provider: &str) -> Option<&'static [&'static str]> {
     match provider {
         "claude" => Some(&["update"]),
@@ -68,8 +72,8 @@ pub async fn harness_latest_version(provider: String) -> Result<String, String> 
 }
 
 /// Runs the harness's self-update against the binary MonoCode resolved for
-/// it. stdin is closed, so an updater that stops to ask fails instead of
-/// hanging.
+/// it, or `mise upgrade` when mise installed that binary. stdin is closed, so
+/// an updater that stops to ask fails instead of hanging.
 #[tauri::command]
 pub async fn harness_update(
     command: String,
@@ -85,7 +89,23 @@ pub async fn harness_update(
         if !is_resolved_harness_binary(&command, Some(&binary_provider), binary_path.as_deref()) {
             return Err("harness_update: not a resolved harness CLI".to_string());
         }
-        let output = exec_output(&command, &args, None, UPDATE_TIMEOUT)?;
+        let output = match mise_tool(Path::new(&command)) {
+            Some((mise, tool)) => {
+                let output = exec_output(
+                    &mise.to_string_lossy(),
+                    &["upgrade".to_string(), "--yes".to_string(), tool],
+                    Some("~"),
+                    UPDATE_TIMEOUT,
+                )?;
+                // A tool locked in mise.lock is on PATH by its version
+                // directory, so the cached PATH still names the old install.
+                if output.status.success() {
+                    forget_login_shell_env();
+                }
+                output
+            }
+            None => exec_output(&command, &args, None, UPDATE_TIMEOUT)?,
+        };
         if output.status.success() {
             return Ok(());
         }
@@ -93,6 +113,80 @@ pub async fn harness_update(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// The mise tool that installed `binary`, with the mise to upgrade it.
+///
+/// A CLI's own updater cannot move a mise install forward. Claude Code only
+/// prints `mise upgrade claude` and exits 0, and npm-style updaters install
+/// into a directory mise never puts on PATH. mise records where each tool
+/// version lives, so this works for any harness and any mise backend.
+///
+/// mise runs from the home directory so it reads the same global config as
+/// the login shell MonoCode resolved the binary from.
+fn mise_tool(binary: &Path) -> Option<(PathBuf, String)> {
+    let mise = which_via_login_shell("mise")?;
+    let mut real = std::fs::canonicalize(binary).ok()?;
+    // A shim is a link to mise itself, which picks the install at run time.
+    if std::fs::canonicalize(&mise).ok()? == real {
+        let name = binary.file_name()?.to_string_lossy().into_owned();
+        let target = run_mise(&mise, &["which", &name])?;
+        real = std::fs::canonicalize(String::from_utf8_lossy(&target).trim()).ok()?;
+    }
+    let installed =
+        serde_json::from_slice(&run_mise(&mise, &["ls", "--installed", "--json"])?).ok()?;
+    let version = exec_output(
+        &binary.to_string_lossy(),
+        &["--version".to_string()],
+        None,
+        MISE_QUERY_TIMEOUT,
+    )
+    .ok()?;
+    let tool = mise_tool_for(&installed, &real, &String::from_utf8_lossy(&version.stdout))?;
+    Some((mise, tool))
+}
+
+const MISE_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn run_mise(mise: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+    let output = exec_output(
+        &mise.to_string_lossy(),
+        &args,
+        Some("~"),
+        MISE_QUERY_TIMEOUT,
+    )
+    .ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+/// Finds the install in `mise ls --installed --json` (tool name to installed
+/// versions, each with an `install_path`) that holds `binary`.
+///
+/// A runtime's install also holds whatever its package manager added: under
+/// a mise Node, `npm i -g @openai/codex` lands in Node's install. That CLI
+/// updates itself through npm, and `mise upgrade node` would be wrong. So the
+/// install counts only when the CLI reports the version mise installed.
+fn mise_tool_for(installed: &Value, binary: &Path, reported_version: &str) -> Option<String> {
+    installed.as_object()?.iter().find_map(|(tool, versions)| {
+        let owns = versions.as_array()?.iter().any(|install| {
+            let holds_binary = install
+                .get("install_path")
+                .and_then(Value::as_str)
+                .is_some_and(|dir| {
+                    // `binary` is canonical; macOS reaches temp and data dirs
+                    // through symlinks such as /var -> /private/var.
+                    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| PathBuf::from(dir));
+                    binary.starts_with(dir)
+                });
+            holds_binary
+                && install
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .is_some_and(|version| reported_version.contains(version))
+        });
+        owns.then(|| tool.clone())
+    })
 }
 
 /// Updaters print their reason to either stream; the last line is the one
@@ -134,6 +228,41 @@ mod tests {
         assert_eq!(update_args("pi"), Some(&["update", "--self"][..]));
         assert_eq!(update_args("opencode"), Some(&["upgrade"][..]));
         assert_eq!(update_args("cursor"), None);
+    }
+
+    #[test]
+    fn finds_the_mise_tool_that_installed_a_cli() {
+        let installed = json!({
+            "aqua:anthropics/claude-code": [{
+                "version": "2.1.308",
+                "install_path": "/home/me/.local/share/mise/installs/aqua-anthropics-claude-code/2.1.308",
+            }],
+            "node": [{
+                "version": "26.11.1",
+                "install_path": "/home/me/.local/share/mise/installs/node/26.11.1",
+            }],
+        });
+        let claude = Path::new(
+            "/home/me/.local/share/mise/installs/aqua-anthropics-claude-code/2.1.308/claude",
+        );
+        assert_eq!(
+            mise_tool_for(&installed, claude, "2.1.308 (Claude Code)\n"),
+            Some("aqua:anthropics/claude-code".to_string())
+        );
+
+        // `npm i -g @openai/codex` under a mise Node: npm updates it, not mise.
+        let codex = Path::new(
+            "/home/me/.local/share/mise/installs/node/26.11.1/lib/node_modules/@openai/codex/bin/codex.js",
+        );
+        assert_eq!(
+            mise_tool_for(&installed, codex, "codex-cli 0.163.0\n"),
+            None
+        );
+
+        assert_eq!(
+            mise_tool_for(&installed, Path::new("/opt/homebrew/bin/claude"), "2.1.308"),
+            None
+        );
     }
 
     #[test]
