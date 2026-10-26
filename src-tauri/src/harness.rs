@@ -3045,7 +3045,7 @@ fn apply_grok_env(cmd: &mut Command) {
     }
 }
 
-static LOGIN_SHELL_ENV: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+pub(crate) static LOGIN_SHELL_ENV: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
 /// Keys worth keeping out of `printenv`. PATH is the important one: a
 /// Finder-launched app inherits only launchd's bare PATH.
@@ -3086,8 +3086,8 @@ fn login_shell_env(name: &str) -> Option<String> {
 
 /// The next lookup reads the login shell again. A version manager that put a
 /// versioned directory on PATH has a new one after an upgrade.
-pub(crate) fn forget_login_shell_env() {
-    if let Ok(mut cache) = LOGIN_SHELL_ENV.lock() {
+pub(crate) fn forget_login_shell_env(cache: &Mutex<Option<HashMap<String, String>>>) {
+    if let Ok(mut cache) = cache.lock() {
         *cache = None;
     }
 }
