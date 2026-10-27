@@ -103,9 +103,9 @@ pub fn find_updates(hidden: &[String]) -> Vec<Update> {
             .collect()
     })
 }
-/// Use exactly the resolved CLI's own updater, or `mise upgrade` when mise
-/// installed it, then verify its actual version and refresh models before
-/// reporting success (exit status alone is insufficient).
+/// Update the resolved CLI the way it was installed (see `Installer`), then
+/// verify its actual version and refresh models before reporting success
+/// (exit status alone is insufficient).
 pub fn run_update(update: &Update) -> Result<String, String> {
     let args: &[&str] = match update.harness {
         Kind::Claude | Kind::Codex => &["update"],
@@ -129,37 +129,55 @@ pub fn run_update(update: &Update) -> Result<String, String> {
 
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Who installed the resolved CLI, which decides what updates it.
+enum Installer {
+    /// The CLI's own updater: native installs, and package managers the
+    /// updater drives itself (Codex and OpenCode run `brew upgrade` or
+    /// `npm install -g` on their own).
+    Cli,
+    /// No harness updater moves a mise install. Claude Code only prints
+    /// `mise upgrade claude` and exits 0; the others don't know mise.
+    Mise { mise: PathBuf, tool: String },
+}
+
+fn installer(binary: &Path, mise: Option<&Path>) -> Result<Installer, String> {
+    if let Some(mise) = mise {
+        if let Some(tool) = mise_tool(mise, binary)? {
+            return Ok(Installer::Mise {
+                mise: mise.to_path_buf(),
+                tool,
+            });
+        }
+    }
+    Ok(Installer::Cli)
+}
+
 fn update_cli(
     binary: &Path,
     args: &[String],
     mise: Option<&Path>,
     shell_env: &Mutex<Option<HashMap<String, String>>>,
 ) -> Result<String, String> {
-    let upgrade = match mise {
-        Some(mise) => mise_tool(mise, binary)?.map(|tool| (mise, tool)),
-        None => None,
-    };
-    let Some((mise, tool)) = upgrade else {
-        return cli::output(binary, args, &cwd(), UPDATE_TIMEOUT);
-    };
-    let output = cli::output(
-        mise,
-        &["upgrade".into(), "--yes".into(), tool],
-        &cwd(),
-        UPDATE_TIMEOUT,
-    )
-    .map_err(|error| mise_reason(&error).to_owned())?;
-    // A tool locked in mise.lock is on PATH by its version directory, so the
-    // cached PATH still names the old install, and so would the version check.
-    forget_login_shell_env(shell_env);
-    Ok(output)
+    match installer(binary, mise)? {
+        Installer::Cli => cli::output(binary, args, &cwd(), UPDATE_TIMEOUT),
+        Installer::Mise { mise, tool } => {
+            let output = cli::output(
+                &mise,
+                &["upgrade".into(), "--yes".into(), tool],
+                &cwd(),
+                UPDATE_TIMEOUT,
+            )
+            .map_err(|error| mise_reason(&error).to_owned())?;
+            // A tool locked in mise.lock is on PATH by its version directory,
+            // so the cached PATH still names the old install, and so would
+            // the version check.
+            forget_login_shell_env(shell_env);
+            Ok(output)
+        }
+    }
 }
 
-/// The mise tool that installed `binary`.
-///
-/// A CLI's own updater cannot move a mise install forward. Claude Code only
-/// prints `mise upgrade claude` and exits 0, and npm-style updaters install
-/// into a directory mise never puts on PATH. mise records where each tool
+/// The mise tool that installed `binary`. mise records where each tool
 /// version lives, so this works for any harness and any mise backend.
 ///
 /// A shim is always mise's, so a failed lookup is an error rather than a
@@ -399,7 +417,7 @@ esac
 
     #[cfg(unix)]
     #[test]
-    fn runs_the_cli_updater_for_an_install_mise_does_not_own() {
+    fn runs_the_cli_updater_when_no_package_manager_owns_the_install() {
         let mise = MiseFixture::new();
         let other = mise.root.path().join("claude");
         std::fs::copy(&mise.install, &other).unwrap();
