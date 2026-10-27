@@ -123,11 +123,12 @@ fn run_update(
         Some("~"),
         UPDATE_TIMEOUT,
     )?;
+    if !output.status.success() {
+        return Err(mise_failure(&output.stdout, &output.stderr));
+    }
     // A tool locked in mise.lock is on PATH by its version directory, so the
     // cached PATH still names the old install.
-    if output.status.success() {
-        forget_login_shell_env(shell_env);
-    }
+    forget_login_shell_env(shell_env);
     Ok(output)
 }
 
@@ -188,10 +189,25 @@ fn run_mise(mise: &Path, args: &[&str]) -> Result<String, String> {
         MISE_QUERY_TIMEOUT,
     )?;
     if !output.status.success() {
-        let reason = update_failure(&output.stdout, &output.stderr);
+        let reason = mise_failure(&output.stdout, &output.stderr);
         return Err(format!("mise {}: {reason}", args.join(" ")));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// mise ends every error with `Version:` and `Run with --verbose` lines, so
+/// the reason is the first `mise ERROR` line, not the last line.
+fn mise_failure(stdout: &[u8], stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            line.starts_with("mise ERROR")
+                && !line.starts_with("mise ERROR Version:")
+                && !line.starts_with("mise ERROR Run with --verbose")
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| update_failure(stdout, stderr))
 }
 
 /// Finds the install in `mise ls --installed --json` (tool name to installed
@@ -345,7 +361,7 @@ mod tests {
                 r#"#!/bin/sh
 if [ "$(basename "$0")" = claude ]; then exec '{install}' "$@"; fi
 case "$1" in
-  which) [ -f '{root_str}/which-fails' ] && {{ echo 'mise ERROR claude is not a mise bin' >&2; exit 1; }}
+  which) [ -f '{root_str}/which-fails' ] && {{ printf '%s\n' 'mise ERROR claude is not a mise bin. Perhaps you need to install it first.' 'mise ERROR Version: 2026.10.13 macos-arm64 (2026-10-17)' 'mise ERROR Run with --verbose or MISE_VERBOSE=1 for more information' >&2; exit 1; }}
          echo '{install}' ;;
   ls) echo '{{"claude":[{{"version":"2.1.308","install_path":"{dir}"}}]}}' ;;
   *) echo "mise $*" >> '{root_str}/log' ;;
@@ -442,7 +458,7 @@ esac
         let error = mise.update(&mise.shim, &cached_shell_env()).unwrap_err();
         assert_eq!(
             error,
-            "mise which claude: mise ERROR claude is not a mise bin"
+            "mise which claude: mise ERROR claude is not a mise bin. Perhaps you need to install it first."
         );
         assert_eq!(mise.log(), "");
     }
