@@ -116,7 +116,8 @@ pub fn run_update(update: &Update) -> Result<String, String> {
     let path = provider::resolve(update.harness).ok_or("CLI could not be resolved")?;
     let args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let mise = resolve_gui_binary("mise");
-    update_cli(&path, &args, mise.as_deref(), &LOGIN_SHELL_ENV)
+    let custom_path = cli::configured(update.harness).is_some();
+    update_cli(&path, &args, mise.as_deref(), custom_path, &LOGIN_SHELL_ENV)
         .map_err(|error| last_line(&error).unwrap_or("Update failed").to_owned())?;
     let version = installed(update.harness).unwrap_or_else(|_| update.installed.clone());
     if compare_versions(&version, &update.latest).is_lt() {
@@ -137,15 +138,22 @@ enum Installer {
     Cli,
     /// No harness updater moves a mise install. Claude Code only prints
     /// `mise upgrade claude` and exits 0; the others don't know mise.
-    Mise { mise: PathBuf, tool: String },
+    Mise { mise: PathBuf, install: MiseInstall },
+}
+
+/// The mise tool version that holds a CLI, as `mise ls` reports it.
+struct MiseInstall {
+    tool: String,
+    version: String,
+    install_path: PathBuf,
 }
 
 fn installer(binary: &Path, mise: Option<&Path>) -> Result<Installer, String> {
     if let Some(mise) = mise {
-        if let Some(tool) = mise_tool(mise, binary)? {
+        if let Some(install) = mise_install(mise, binary)? {
             return Ok(Installer::Mise {
                 mise: mise.to_path_buf(),
-                tool,
+                install,
             });
         }
     }
@@ -156,14 +164,24 @@ fn update_cli(
     binary: &Path,
     args: &[String],
     mise: Option<&Path>,
+    custom_path: bool,
     shell_env: &Mutex<Option<HashMap<String, String>>>,
 ) -> Result<String, String> {
     match installer(binary, mise)? {
         Installer::Cli => cli::output(binary, args, &cwd(), UPDATE_TIMEOUT),
-        Installer::Mise { mise, tool } => {
+        Installer::Mise { mise, install } => {
+            // A CLI path set in Settings that points into one version's
+            // install keeps running that version after an upgrade, and
+            // MonoCode can't repoint it. A shim or `latest` path follows.
+            if custom_path && binary.starts_with(&install.install_path) {
+                return Err(format!(
+                    "The CLI path is pinned to mise's {} install, so upgrading won't change the CLI MonoCode runs. Run `mise upgrade {}`, then update the CLI path, or set it to mise's shim to follow upgrades.",
+                    install.version, install.tool
+                ));
+            }
             let output = cli::output(
                 &mise,
-                &["upgrade".into(), "--yes".into(), tool],
+                &["upgrade".into(), "--yes".into(), install.tool],
                 &cwd(),
                 UPDATE_TIMEOUT,
             )
@@ -177,14 +195,14 @@ fn update_cli(
     }
 }
 
-/// The mise tool that installed `binary`. mise records where each tool
+/// The mise install that holds `binary`. mise records where each tool
 /// version lives, so this works for any harness and any mise backend.
 ///
 /// A shim is always mise's, so a failed lookup is an error rather than a
 /// reason to run the CLI's own updater against mise's install. For any other
 /// binary, a failed lookup only means MonoCode can't tell, and the CLI's own
 /// updater runs.
-fn mise_tool(mise: &Path, binary: &Path) -> Result<Option<String>, String> {
+fn mise_install(mise: &Path, binary: &Path) -> Result<Option<MiseInstall>, String> {
     let Ok(real) = std::fs::canonicalize(binary) else {
         return Ok(None);
     };
@@ -202,7 +220,11 @@ fn mise_tool(mise: &Path, binary: &Path) -> Result<Option<String>, String> {
     Ok(installed_mise_tool(mise, binary, &real).ok().flatten())
 }
 
-fn installed_mise_tool(mise: &Path, binary: &Path, real: &Path) -> Result<Option<String>, String> {
+fn installed_mise_tool(
+    mise: &Path,
+    binary: &Path,
+    real: &Path,
+) -> Result<Option<MiseInstall>, String> {
     let installed = run_mise(mise, &["ls", "--installed", "--json"])?;
     let installed: Value = serde_json::from_str(&installed).map_err(|e| format!("mise ls: {e}"))?;
     let version = cli::output(binary, &["--version".into()], &cwd(), MISE_QUERY_TIMEOUT)?;
@@ -241,25 +263,22 @@ fn mise_reason(error: &str) -> &str {
 /// a mise Node, `npm i -g @openai/codex` lands in Node's install. That CLI
 /// updates itself through npm, and `mise upgrade node` would be wrong. So the
 /// install counts only when the CLI reports the version mise installed.
-fn mise_tool_for(installed: &Value, binary: &Path, reported_version: &str) -> Option<String> {
+fn mise_tool_for(installed: &Value, binary: &Path, reported_version: &str) -> Option<MiseInstall> {
     installed.as_object()?.iter().find_map(|(tool, versions)| {
-        let owns = versions.as_array()?.iter().any(|install| {
-            let holds_binary = install
-                .get("install_path")
-                .and_then(Value::as_str)
-                .is_some_and(|dir| {
-                    // `binary` is canonical; macOS reaches temp and data dirs
-                    // through symlinks such as /var -> /private/var.
-                    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| PathBuf::from(dir));
-                    binary.starts_with(dir)
-                });
-            holds_binary
-                && install
-                    .get("version")
-                    .and_then(Value::as_str)
-                    .is_some_and(|version| reports_version(reported_version, version))
-        });
-        owns.then(|| tool.clone())
+        versions.as_array()?.iter().find_map(|install| {
+            let install_path = PathBuf::from(install.get("install_path")?.as_str()?);
+            let version = install.get("version")?.as_str()?;
+            // `binary` is canonical; macOS reaches temp and data dirs
+            // through symlinks such as /var -> /private/var.
+            let dir = std::fs::canonicalize(&install_path).unwrap_or_else(|_| install_path.clone());
+            (binary.starts_with(dir) && reports_version(reported_version, version)).then(|| {
+                MiseInstall {
+                    tool: tool.clone(),
+                    version: version.to_owned(),
+                    install_path,
+                }
+            })
+        })
     })
 }
 
@@ -297,20 +316,18 @@ mod tests {
         let claude = Path::new(
             "/home/me/.local/share/mise/installs/aqua-anthropics-claude-code/2.1.308/claude",
         );
-        assert_eq!(
-            mise_tool_for(&installed, claude, "2.1.308 (Claude Code)"),
-            Some("aqua:anthropics/claude-code".to_string())
-        );
+        let found = mise_tool_for(&installed, claude, "2.1.308 (Claude Code)").unwrap();
+        assert_eq!(found.tool, "aqua:anthropics/claude-code");
+        assert_eq!(found.version, "2.1.308");
 
         // `npm i -g @openai/codex` under a mise Node: npm updates it, not mise.
         let codex = Path::new(
             "/home/me/.local/share/mise/installs/node/26.11.1/lib/node_modules/@openai/codex/bin/codex.js",
         );
-        assert_eq!(mise_tool_for(&installed, codex, "codex-cli 0.163.0"), None);
+        assert!(mise_tool_for(&installed, codex, "codex-cli 0.163.0").is_none());
 
-        assert_eq!(
-            mise_tool_for(&installed, Path::new("/opt/homebrew/bin/claude"), "2.1.308"),
-            None
+        assert!(
+            mise_tool_for(&installed, Path::new("/opt/homebrew/bin/claude"), "2.1.308").is_none()
         );
     }
 
@@ -322,13 +339,15 @@ mod tests {
         assert!(!reports_version("codex-cli 0.163.0-alpha", "0.163.0"));
     }
 
-    /// A fake mise with one Claude Code install and a shim for it. Like real
-    /// mise, it runs the install when called through the shim.
+    /// A fake mise with Claude Code 2.1.308 installed, a `latest` link to it
+    /// and a shim. Like real mise, the shim runs the current install, and
+    /// `mise upgrade` installs 2.1.310 and moves `latest` to it.
     #[cfg(unix)]
     struct MiseFixture {
         root: tempfile::TempDir,
         mise: PathBuf,
         install: PathBuf,
+        latest: PathBuf,
         shim: PathBuf,
     }
 
@@ -345,15 +364,21 @@ mod tests {
             let base_str = base.to_string_lossy();
             let mise = base.join("mise");
             let install = dir.join("claude");
+            let latest = base.join("installs/claude/latest/claude");
             let shim = base.join("shims/claude");
             let script = format!(
                 r#"#!/bin/sh
-if [ "$(basename "$0")" = claude ]; then exec '{install}' "$@"; fi
+current="$(cd '{base_str}/installs/claude/latest' && pwd -P)/claude"
+if [ "$(basename "$0")" = claude ]; then exec "$current" "$@"; fi
 case "$1" in
   which) [ -f '{base_str}/which-fails' ] && {{ printf '%s\n' 'mise ERROR claude is not a mise bin. Perhaps you need to install it first.' 'mise ERROR Version: 2026.10.13 macos-arm64 (2026-10-17)' 'mise ERROR Run with --verbose or MISE_VERBOSE=1 for more information' >&2; exit 1; }}
-         echo '{install}' ;;
+         echo "$current" ;;
   ls) echo '{{"claude":[{{"version":"2.1.308","install_path":"{dir}"}}]}}' ;;
-  *) echo "mise $*" >> '{base_str}/log' ;;
+  upgrade) echo "mise $*" >> '{base_str}/log'
+           mkdir -p '{base_str}/installs/claude/2.1.310'
+           sed 's/2\.1\.308/2.1.310/' '{install}' > '{base_str}/installs/claude/2.1.310/claude'
+           chmod +x '{base_str}/installs/claude/2.1.310/claude'
+           ln -sfn 2.1.310 '{base_str}/installs/claude/latest' ;;
 esac
 "#,
                 install = install.display(),
@@ -370,11 +395,13 @@ esac
             for path in [&mise, &install] {
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
+            std::os::unix::fs::symlink("2.1.308", base.join("installs/claude/latest")).unwrap();
             std::os::unix::fs::symlink(&mise, &shim).unwrap();
             MiseFixture {
                 root,
                 mise,
                 install,
+                latest,
                 shim,
             }
         }
@@ -382,9 +409,16 @@ esac
         fn update(
             &self,
             binary: &Path,
+            custom_path: bool,
             shell_env: &Mutex<Option<HashMap<String, String>>>,
         ) -> Result<String, String> {
-            update_cli(binary, &["update".to_string()], Some(&self.mise), shell_env)
+            update_cli(
+                binary,
+                &["update".to_string()],
+                Some(&self.mise),
+                custom_path,
+                shell_env,
+            )
         }
 
         fn log(&self) -> String {
@@ -401,18 +435,52 @@ esac
     }
 
     #[cfg(unix)]
+    fn version(binary: &Path) -> String {
+        cli::output(binary, &["--version".into()], &cwd(), MISE_QUERY_TIMEOUT).unwrap()
+    }
+
+    #[cfg(unix)]
     #[test]
     fn upgrades_a_mise_install_through_mise_and_rereads_path() {
-        let mise = MiseFixture::new();
-        for binary in [&mise.install, &mise.shim] {
+        let paths: [fn(&MiseFixture) -> PathBuf; 2] = [|m| m.install.clone(), |m| m.shim.clone()];
+        for binary in paths {
+            let mise = MiseFixture::new();
+            let binary = binary(&mise);
             let shell_env = cached_shell_env();
-            mise.update(binary, &shell_env).unwrap();
+            mise.update(&binary, false, &shell_env).unwrap();
             assert!(shell_env.lock().unwrap().is_none(), "{}", binary.display());
+            assert_eq!(mise.log(), "mise upgrade --yes claude\n");
         }
-        assert_eq!(
-            mise.log(),
-            "mise upgrade --yes claude\nmise upgrade --yes claude\n"
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_custom_cli_path_runs_the_new_version_only_if_it_follows_upgrades() {
+        let paths: [fn(&MiseFixture) -> PathBuf; 2] = [|m| m.latest.clone(), |m| m.shim.clone()];
+        for binary in paths {
+            let mise = MiseFixture::new();
+            let binary = binary(&mise);
+            mise.update(&binary, true, &cached_shell_env()).unwrap();
+            assert_eq!(
+                version(&binary),
+                "2.1.310 (Claude Code)",
+                "{}",
+                binary.display()
+            );
+        }
+
+        // A path into 2.1.308's own directory would keep running 2.1.308.
+        let mise = MiseFixture::new();
+        let error = mise
+            .update(&mise.install, true, &cached_shell_env())
+            .unwrap_err();
+        assert!(
+            error.contains("pinned to mise's 2.1.308 install"),
+            "{error}"
         );
+        assert!(error.contains("`mise upgrade claude`"), "{error}");
+        assert_eq!(mise.log(), "");
+        assert_eq!(version(&mise.install), "2.1.308 (Claude Code)");
     }
 
     #[cfg(unix)]
@@ -422,7 +490,7 @@ esac
         let other = mise.root.path().join("claude");
         std::fs::copy(&mise.install, &other).unwrap();
         let shell_env = cached_shell_env();
-        mise.update(&other, &shell_env).unwrap();
+        mise.update(&other, false, &shell_env).unwrap();
         assert_eq!(mise.log(), "claude update\n");
         assert!(shell_env.lock().unwrap().is_some());
     }
@@ -432,7 +500,9 @@ esac
     fn reports_a_failed_mise_lookup_for_a_shim() {
         let mise = MiseFixture::new();
         std::fs::write(mise.root.path().join("which-fails"), "").unwrap();
-        let error = mise.update(&mise.shim, &cached_shell_env()).unwrap_err();
+        let error = mise
+            .update(&mise.shim, false, &cached_shell_env())
+            .unwrap_err();
         assert_eq!(
             error,
             "mise which claude: mise ERROR claude is not a mise bin. Perhaps you need to install it first."
