@@ -116,9 +116,23 @@ pub fn run_update(update: &Update) -> Result<String, String> {
     let path = provider::resolve(update.harness).ok_or("CLI could not be resolved")?;
     let args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let mise = resolve_gui_binary("mise");
-    let custom_path = cli::configured(update.harness).is_some();
-    update_cli(&path, &args, mise.as_deref(), custom_path, &LOGIN_SHELL_ENV)
-        .map_err(|error| last_line(&error).unwrap_or("Update failed").to_owned())?;
+    // Where a custom path came from, in the order `provider::resolve` reads them.
+    let override_var = provider::binary_override_var(update.harness);
+    let custom_path = if cli::configured(update.harness).is_some() {
+        Some("The CLI path".to_owned())
+    } else if std::env::var_os(&override_var).is_some_and(|value| !value.is_empty()) {
+        Some(override_var)
+    } else {
+        None
+    };
+    update_cli(
+        &path,
+        &args,
+        mise.as_deref(),
+        custom_path.as_deref(),
+        &LOGIN_SHELL_ENV,
+    )
+    .map_err(|error| last_line(&error).unwrap_or("Update failed").to_owned())?;
     let version = installed(update.harness).unwrap_or_else(|_| update.installed.clone());
     if compare_versions(&version, &update.latest).is_lt() {
         return Err(format!("Still on {version} after updating."));
@@ -164,18 +178,20 @@ fn update_cli(
     binary: &Path,
     args: &[String],
     mise: Option<&Path>,
-    custom_path: bool,
+    custom_path: Option<&str>,
     shell_env: &Mutex<Option<HashMap<String, String>>>,
 ) -> Result<String, String> {
     match installer(binary, mise)? {
         Installer::Cli => cli::output(binary, args, &cwd(), UPDATE_TIMEOUT),
         Installer::Mise { mise, install } => {
-            // A CLI path set in Settings that points into one version's
-            // install keeps running that version after an upgrade, and
-            // MonoCode can't repoint it. A shim or `latest` path follows.
-            if custom_path && binary.starts_with(&install.install_path) {
+            // A custom path (Settings or the environment) that points into
+            // one version's install keeps running that version after an
+            // upgrade, and MonoCode can't repoint it. A shim or `latest`
+            // path follows upgrades.
+            if let Some(source) = custom_path.filter(|_| binary.starts_with(&install.install_path))
+            {
                 return Err(format!(
-                    "The CLI path is pinned to mise's {} install, so upgrading won't change the CLI MonoCode runs. Run `mise upgrade {}`, then update the CLI path, or set it to mise's shim to follow upgrades.",
+                    "{source} is pinned to mise's {} install, so upgrading won't change the CLI MonoCode runs. Run `mise upgrade {}`, then update it, or point it at mise's shim to follow upgrades.",
                     install.version, install.tool
                 ));
             }
@@ -409,7 +425,7 @@ esac
         fn update(
             &self,
             binary: &Path,
-            custom_path: bool,
+            custom_path: Option<&str>,
             shell_env: &Mutex<Option<HashMap<String, String>>>,
         ) -> Result<String, String> {
             update_cli(
@@ -447,7 +463,7 @@ esac
             let mise = MiseFixture::new();
             let binary = binary(&mise);
             let shell_env = cached_shell_env();
-            mise.update(&binary, false, &shell_env).unwrap();
+            mise.update(&binary, None, &shell_env).unwrap();
             assert!(shell_env.lock().unwrap().is_none(), "{}", binary.display());
             assert_eq!(mise.log(), "mise upgrade --yes claude\n");
         }
@@ -460,7 +476,8 @@ esac
         for binary in paths {
             let mise = MiseFixture::new();
             let binary = binary(&mise);
-            mise.update(&binary, true, &cached_shell_env()).unwrap();
+            mise.update(&binary, Some("The CLI path"), &cached_shell_env())
+                .unwrap();
             assert_eq!(
                 version(&binary),
                 "2.1.310 (Claude Code)",
@@ -472,10 +489,14 @@ esac
         // A path into 2.1.308's own directory would keep running 2.1.308.
         let mise = MiseFixture::new();
         let error = mise
-            .update(&mise.install, true, &cached_shell_env())
+            .update(
+                &mise.install,
+                Some("MONOCODE_CLAUDE_BINARY"),
+                &cached_shell_env(),
+            )
             .unwrap_err();
         assert!(
-            error.contains("pinned to mise's 2.1.308 install"),
+            error.starts_with("MONOCODE_CLAUDE_BINARY is pinned to mise's 2.1.308 install"),
             "{error}"
         );
         assert!(error.contains("`mise upgrade claude`"), "{error}");
@@ -490,7 +511,7 @@ esac
         let other = mise.root.path().join("claude");
         std::fs::copy(&mise.install, &other).unwrap();
         let shell_env = cached_shell_env();
-        mise.update(&other, false, &shell_env).unwrap();
+        mise.update(&other, None, &shell_env).unwrap();
         assert_eq!(mise.log(), "claude update\n");
         assert!(shell_env.lock().unwrap().is_some());
     }
@@ -501,7 +522,7 @@ esac
         let mise = MiseFixture::new();
         std::fs::write(mise.root.path().join("which-fails"), "").unwrap();
         let error = mise
-            .update(&mise.shim, false, &cached_shell_env())
+            .update(&mise.shim, None, &cached_shell_env())
             .unwrap_err();
         assert_eq!(
             error,
